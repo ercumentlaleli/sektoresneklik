@@ -113,6 +113,24 @@ Ek satırlar:
   regres edilir; göreli fiyat Δln(USD/TRY) ve Δln(USD/EUR) ile araçlanır. Bu, birim değerden gelen
   ortak ölçüm hatasının ("bölme yanlılığı") fiyat esnekliğini negatife çekme riskine karşı kontroldür.
 
+## Arayüz (Streamlit)
+
+Sonuçları incelemek ve indirmek için:
+
+```bash
+streamlit run app.py
+```
+
+Sekmeler: **Özet** (sektör × bölge ısı haritası, anlamlılık filtresi), **Sektör** (bölgelere göre
+esneklikler, %95 güven aralığı, öncesi/sonrası karşılaştırması, 60 aylık kayan pencere), **Bölge**
+(sektörlere göre esneklikler), **Sağlamlık** (panel ECM ile hücre ARDL karşılaştırması, LP-IV tepki
+eğrileri), **Veri ve yöntem** (birim değer endeksi, reel ihracat, göreli fiyat, gelir serileri; kapsam
+tabloları), **İndir** (seçili görünüm CSV, tüm tablolar Excel, tüm sonuç ve veri dosyaları ZIP).
+Kenar çubuğundan esneklik türü, dönem ve model seçilir.
+
+Uygulama yalnızca depodaki `output/` ve `data/processed/` dosyalarını okur, API anahtarı istemez.
+Streamlit Community Cloud'da yayınlamak için depoyu bağlayıp ana dosya olarak `app.py`'yi seçmek yeterlidir.
+
 ## Çalıştırma
 
 ```bash
