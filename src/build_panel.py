@@ -241,6 +241,8 @@ def main():
     for (s, r), g in d.groupby(["sector", "region"], sort=True):
         v = g.groupby("date").primaryValue.sum().reindex(MONTHS)
         lp, nitems = unit_value_index(g)
+        if nitems < UV_MIN_ITEMS:  # birim değer endeksi için yetersiz kalem -> hücre modele girmez
+            lp[:] = np.nan
         uvinfo.append({"sector": s, "region": r, "medyan_kalem": nitems,
                        "ihracat_2015_19_mn_usd": g[(g.date.dt.year >= 2015) & (g.date.dt.year <= 2019)]
                        .primaryValue.sum() / 5e6,

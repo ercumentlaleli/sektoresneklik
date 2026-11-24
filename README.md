@@ -158,3 +158,9 @@ Comtrade çağrı başına 100 000 satır döndürür. Bu yüzden her ay üç pa
 - MENA, BDT, Diğer Avrupa ve SSA geliri yıllık WEO verisinden aya interpole edilmiştir. 2026 IMF tahminidir.
 - Arz tarafı değişkeni (ör. sektörel üretim veya kapasite) modelde yer almaz. Esneklikler talep
   denklemi olarak yorumlanmalıdır.
+- LP-IV'de kur araçları, bölgeye özel birim değer temelli göreli fiyat için zayıftır (1. aşama F
+  medyanı ≈ 3). Bu yüzden LP-IV yalnızca yön kontrolü olarak okunmalıdır.
+- Pandemi sonrası örneklem kısadır (2021/01–2026/08). Gelir değişkeni bu dönemde yavaş seyreden,
+  kısmen IMF tahminine dayalı bir seridir; pandemi sonrası **gelir** esneklikleri zayıf belirlenir.
+- Bazı gelir esneklikleri çok yüksektir (> 5). Bu katsayılar, gelir değişkeninin Türkiye'nin
+  arz/kapasite kaynaklı ihracat büyümesini de üstlenmesinden kaynaklanabilir.
