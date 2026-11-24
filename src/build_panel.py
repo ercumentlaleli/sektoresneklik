@@ -1,13 +1,14 @@
-"""Sektör × bölge × ay paneli.
+"""Sektör (NACE Rev.2, C10–C33) × bölge × ay paneli.
 
 Değişkenler (hepsi log, USD bazlı):
-- lx   : reel ihracat = nominal ihracat / sektör ihracat fiyat endeksi
-- lp   : sektör ihracat fiyatı (TÜİK SITC birim değer endeksleri, Comtrade değer ağırlıklı Törnqvist)
-- (bölgeye özel fiyat: HS6 verisi gelince eklenecek; HS2 düzeyinde kg toplamı yok)
+- lv   : nominal ihracat (Comtrade HS6 × ülke, HS6 → NACE eşlemesiyle sektöre toplanmış)
+- lp   : bölgeye özel sektör ihracat birim değer endeksi (kilogram başına USD; ağırlıklı
+         zaman-ürün kuklası (TPD) regresyonu, kalem = HS6 × varış ülkesi)
+- lx   : reel ihracat = lv - lp
 - lpf  : bölge fiyat düzeyi, USD (ülke TÜFE / kur, Türkiye ihracat ağırlıklı geometrik)
 - lrp  : göreli fiyat = lp - lpf
 - ly   : bölge reel geliri (AB/ABD: çeyreklik GSYH; diğerleri: WEO yıllık GSYH; aya interpole)
-- lusd : USD/TRY, leur: USD per EUR (LP-IV araç değişkenleri)
+- lusd : USD/TRY, leur: USD per EUR, loil: Brent (LP-IV araç değişkenleri / kontroller)
 """
 import glob
 import json
@@ -18,7 +19,9 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
-from config import END, PRICE_EXCLUDE, PROC, RAW, REGIONS, SECTORS, START  # noqa: E402
+from config import (END, PRICE_EXCLUDE, PROC, RAW, REGIONS, SECTORS, START,  # noqa: E402
+                    UV_MIN_ITEMS, UV_MIN_VALUE, UV_TRIM)
+from fetch_comtrade import partner_codes  # noqa: E402
 
 MONTHS = pd.period_range(START, END, freq="M")
 EURO = {"AUT": 1999, "BEL": 1999, "CYP": 2008, "FIN": 1999, "FRA": 1999, "DEU": 1999, "GRC": 2001,
@@ -26,51 +29,102 @@ EURO = {"AUT": 1999, "BEL": 1999, "CYP": 2008, "FIN": 1999, "FRA": 1999, "DEU": 
         "SVN": 2007, "ESP": 1999, "EST": 2011, "LVA": 2014, "LTU": 2015, "HRV": 2023}
 
 
-# ---------------------------------------------------------------- Comtrade
+# ---------------------------------------------------------------- Comtrade HS6
 def load_comtrade():
-    ref = json.load(open(RAW.parent / "ref" / "partnerAreas.json"))["results"]
-    iso = {r["PartnerCode"]: r.get("PartnerCodeIsoAlpha3") for r in ref}
-    rows = []
-    for f in glob.glob(str(RAW / "comtrade" / "*.json")):
-        for r in json.load(open(f)):
-            rows.append((r["period"], r["partnerCode"], r["cmdCode"], r["primaryValue"], r["netWgt"]))
-    d = pd.DataFrame(rows, columns=["period", "pcode", "hs", "value", "kg"]).drop_duplicates()
-    d["iso"] = d.pcode.map(iso)
-    d["date"] = pd.PeriodIndex(d.period.astype(str), freq="M")
+    """HS6 × ülke × ay ihracatı; NACE bölümü ve bölge eklenmiş. Dünya (partner 0) ayrı döner."""
+    files = sorted(glob.glob(str(RAW / "comtrade_hs6" / "*.parquet")))
+    d = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    d = d.drop_duplicates(["period", "partnerCode", "cmdCode"])
+    d = d[d.cmdCode.str.len() == 6]
+    conc = pd.read_csv(RAW.parent / "ref" / "hs6_nace2.csv", dtype=str)
+    conc["sector"] = "C" + conc.nace2
+    d = d.merge(conc[["hs_rev", "hs6", "sector"]], left_on=["classificationCode", "cmdCode"],
+                right_on=["hs_rev", "hs6"], how="left").drop(columns=["hs_rev", "hs6"])
+    code2iso = {v: k for k, v in partner_codes().items()}
     c2r = {c: r for r, cs in REGIONS.items() for c in cs}
+    d["iso"] = d.partnerCode.map(code2iso)
     d["region"] = d.iso.map(c2r)
-    return d
+    d["date"] = pd.PeriodIndex(d.period, freq="M")
+    d = d[(d.date >= MONTHS[0]) & (d.date <= MONTHS[-1])]
+    world = d[d.partnerCode == 0]
+    d = d[d.region.notna()]
+    return d, world
 
 
-def tuik_uv():
-    """TÜİK aylık SITC Rev.4 ihracat birim değer endeksleri (USD, 2015=100), log."""
-    t = pd.read_csv(RAW / "macro" / "tuik_DF_IHRACAT_BIRIM_DEGER_V1.csv", low_memory=False)
-    t = t[t.FREQ == "M"]
-    t = t[t.SITC_REV4_205.astype(str) != "_Z"]
-    u = t.pivot_table(index="TIME_PERIOD", columns=t.SITC_REV4_205.astype(str), values="OBS_VALUE")
-    u.index = pd.PeriodIndex(u.index, freq="M")
-    return np.log(u).reindex(MONTHS)
+def coverage_report(d, world):
+    """Eşleme kapsamı: dünya ihracatının imalat sektörlerine atanan payı, çok-bölümlü HS6 payı."""
+    conc = pd.read_csv(RAW.parent / "ref" / "hs6_nace2.csv", dtype=str)
+    multi = set(zip(conc.hs_rev[conc.n_div.astype(int) > 1], conc.hs6[conc.n_div.astype(int) > 1]))
+    w = world.assign(year=world.date.dt.year,
+                     manuf=world.sector.isin(SECTORS),
+                     multi=[(a, b) in multi for a, b in zip(world.classificationCode, world.cmdCode)])
+    tot = w.groupby("year").primaryValue.sum()
+    rep = pd.DataFrame({
+        "dunya_ihracat_mlr_usd": tot / 1e9,
+        "imalat_payi": w[w.manuf].groupby("year").primaryValue.sum() / tot,
+        "cok_bolumlu_hs6_payi": w[w.multi].groupby("year").primaryValue.sum() / tot,
+        "bolgeler_payi": d.assign(year=d.date.dt.year).groupby("year").primaryValue.sum() / tot,
+        "kg_mevcut_payi": w[w.netWgt > 0].groupby("year").primaryValue.sum() / tot,
+    })
+    return rep
 
 
-def sector_price(world, hs2sitc, luv):
-    """Sektör ihracat fiyatı (log): SITC birim değer endekslerinin zincirleme Törnqvist'i.
-    Ağırlıklar: Comtrade'de HS fasıllarının (SITC'ye eşlenmiş) dünya ihracat değeri payları."""
-    w = world.assign(sitc=world.hs.map(hs2sitc)).pivot_table(
-        index="date", columns="sitc", values="value", aggfunc="sum").reindex(MONTHS)
-    s = w.div(w.sum(axis=1), axis=0)
-    dl = luv[s.columns].diff()
-    wb = (s + s.shift(1)) / 2
-    ok = dl.notna() & wb.notna()
-    wn = wb.where(ok)
-    wn = wn.div(wn.sum(axis=1), axis=0)
-    return (wn * dl.where(ok)).sum(axis=1, min_count=1).fillna(0.0).cumsum()
+# ---------------------------------------------------------------- unit value index
+def tpd(item, t, y, w, T, iters=500, tol=1e-9):
+    """Ağırlıklı zaman-ürün kuklası: y_it = a_i + d_t + e_it, ağırlık w (ay içi değer payı).
+    Değişen yönlerde ortalama alma (alternating projections). d_0 = 0 normalizasyonu."""
+    a = np.zeros(item.max() + 1)
+    dlt = np.zeros(T)
+    sw_i = np.bincount(item, w, len(a))
+    sw_t = np.bincount(t, w, T)
+    for _ in range(iters):
+        a = np.bincount(item, w * (y - dlt[t]), len(a)) / np.where(sw_i > 0, sw_i, 1)
+        new = np.bincount(t, w * (y - a[item]), T) / np.where(sw_t > 0, sw_t, 1)
+        if np.max(np.abs(new - dlt)) < tol:
+            dlt = new
+            break
+        dlt = new
+    return a, dlt
+
+
+def unit_value_index(g):
+    """Bir sektör × bölge için aylık log birim değer endeksi (2015 ortalaması = 0).
+    Kalem: HS6 kodu × varış ülkesi. Birim değer = USD / net kg."""
+    g = g[(g.netWgt > 0) & (g.primaryValue >= UV_MIN_VALUE) & ~g.isNetWgtEstimated.fillna(False)]
+    if g.empty:
+        return pd.Series(np.nan, index=MONTHS), 0
+    item = pd.factorize(g.cmdCode + "_" + g.iso)[0]
+    t = ((g.date.dt.year - MONTHS[0].year) * 12 + g.date.dt.month - MONTHS[0].month).to_numpy()
+    y = np.log(g.primaryValue.to_numpy() / g.netWgt.to_numpy())
+    v = g.primaryValue.to_numpy()
+    w = v / np.bincount(t, v, len(MONTHS))[t]
+    T = len(MONTHS)
+    keep = np.ones(len(y), bool)
+    for _ in range(2):  # artıklara göre aykırı değer kırpma, yeniden tahmin
+        a, dl = tpd(item[keep], t[keep], y[keep], w[keep], T)
+        e = y - a[item] - dl[t]
+        e[~keep] = 0
+        mad = 1.4826 * np.median(np.abs(e[keep]))
+        keep = np.abs(e) <= UV_TRIM * max(mad, 1e-6)
+    a, dl = tpd(item[keep], t[keep], y[keep], w[keep], T)
+    # tek dönemlik kalemler endeksi tanımlamaz; ay başına "köprülenmiş" kalem sayısı
+    multi = np.bincount(item[keep], minlength=item.max() + 1) > 1
+    n_t = np.bincount(t[keep][multi[item[keep]]], minlength=T)
+    s = pd.Series(dl, index=MONTHS).where(n_t >= UV_MIN_ITEMS)
+    s = s.interpolate(limit_area="inside")
+    base = s[s.index.year == 2015]
+    s = s - (base.mean() if base.notna().any() else s.mean())
+    return s, int(np.median(n_t[n_t > 0])) if (n_t > 0).any() else 0
 
 
 # ---------------------------------------------------------------- weights
 def country_weights(d):
-    """Bölge içi ülke ağırlıkları: 2015-2019 Türkiye ihracat payı (pilot fasılların toplamı)."""
-    m = d[(d.date.dt.year >= 2015) & (d.date.dt.year <= 2019) & d.region.notna()]
-    w = m.groupby(["region", "iso"]).value.sum()
+    """Bölge içi ülke ağırlıkları: 2015-2019 Türkiye imalat ihracatı payı."""
+    m = d[(d.date.dt.year >= 2015) & (d.date.dt.year <= 2019) & d.sector.isin(SECTORS)]
+    if m.region.nunique() < len(REGIONS):  # 2015-2019 henüz indirilmemişse (test) tüm dönem
+        print("UYARI: 2015-2019 verisi eksik, ülke ağırlıkları tüm dönemden")
+        m = d[d.sector.isin(SECTORS)]
+    w = m.groupby(["region", "iso"]).primaryValue.sum()
     return w / w.groupby(level=0).transform("sum")
 
 
@@ -175,36 +229,35 @@ def fx():
 
 def main():
     PROC.mkdir(parents=True, exist_ok=True)
-    d = load_comtrade()
+    d, world = load_comtrade()
+    rep = coverage_report(d, world)
+    rep.round(4).to_csv(PROC / "coverage.csv")
+    print(rep.round(3))
     w = country_weights(d)
     w.rename("weight").to_csv(PROC / "country_weights.csv")
-    Y = income(w)
-    PF = partner_prices(w)
-    FX = fx()
-    luv = tuik_uv()
-    rows = []
-    for s, meta in SECTORS.items():
-        hs = list(meta["hs"])
-        ds = d[d.hs.isin(hs)]
-        months_per_hs = ds[ds.pcode == 0].groupby("hs").date.nunique().reindex(hs).fillna(0)
-        if (months_per_hs < len(MONTHS) - 3).any():
-            print(f"{s}: veri eksik, atlandı ->", months_per_hs.astype(int).to_dict())
-            continue
-        lp = sector_price(ds[ds.pcode == 0], meta["hs"], luv)
-        for r in REGIONS:
-            dr = ds[ds.region == r]
-            v = dr.groupby("date").value.sum().reindex(MONTHS)
-            p = pd.DataFrame({"sector": s, "region": r, "date": MONTHS,
-                              "lv": np.log(v.values), "lp": lp.values,
-                              "lpf": PF[r].values, "ly": Y[r].values})
-            p = pd.concat([p, FX.reset_index(drop=True)], axis=1)
-            p["lx"] = p.lv - p.lp
-            p["lrp"] = p.lp - p.lpf
-            rows.append(p)
+    Y, PF, FX = income(w), partner_prices(w), fx()
+    d = d[d.sector.isin(SECTORS)]
+    rows, uvinfo = [], []
+    for (s, r), g in d.groupby(["sector", "region"], sort=True):
+        v = g.groupby("date").primaryValue.sum().reindex(MONTHS)
+        lp, nitems = unit_value_index(g)
+        uvinfo.append({"sector": s, "region": r, "medyan_kalem": nitems,
+                       "ihracat_2015_19_mn_usd": g[(g.date.dt.year >= 2015) & (g.date.dt.year <= 2019)]
+                       .primaryValue.sum() / 5e6,
+                       "uv_eksik_ay": int(lp.isna().sum())})
+        p = pd.DataFrame({"sector": s, "region": r, "date": MONTHS,
+                          "lv": np.log(v.where(v > 0)).values, "lp": lp.values,
+                          "lpf": PF[r].values, "ly": Y[r].values})
+        p = pd.concat([p, FX.reset_index(drop=True)], axis=1)
+        p["lx"] = p.lv - p.lp
+        p["lrp"] = p.lp - p.lpf
+        rows.append(p)
     panel = pd.concat(rows, ignore_index=True)
     panel["date"] = panel.date.astype(str)
     panel.to_csv(PROC / "panel.csv", index=False)
-    print(panel.groupby(["sector", "region"]).agg(n=("lx", "count"), lv_mean=("lv", "mean")).round(2))
+    info = pd.DataFrame(uvinfo)
+    info.round(1).to_csv(PROC / "uv_index_info.csv", index=False)
+    print(info.pivot(index="sector", columns="region", values="medyan_kalem"))
 
 
 if __name__ == "__main__":

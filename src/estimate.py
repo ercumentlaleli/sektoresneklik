@@ -1,17 +1,21 @@
-"""İhracat talep esneklikleri: ARDL-ECM (ana model), kayan pencere ve LP-IV (sağlamlık).
+"""İhracat talep esneklikleri.
 
-ECM (her sektör × bölge):
-  Δlx_t = c + φ·lx_{t-1} + θp·lrp_{t-1} + θy·ly_{t-1}
-          [+ D_post·(c2 + δp·lrp_{t-1} + δy·ly_{t-1})]
-          + Σ a_i Δlx_{t-i} + Σ b_i Δlrp_{t-i} + Σ g_i Δly_{t-i} + ay kuklaları + COVID kuklaları + ε
-  Uzun dönem fiyat esnekliği = -θp/φ ; gelir esnekliği = -θy/φ  (delta yöntemi ile SE)
-  Pandemi sonrası (2021+) uzun dönem = -(θ+δ)/φ
-  Kısa dönem (etki) esneklikleri = b_0, g_0
-  Eşbütünleşme: Pesaran-Shin-Smith sınır testi (F ve t), case III, k=2.
+ANA MODEL – Panel ECM (her sektörde bölgeler havuzlanmış, i = bölge):
+  Δlx_it = μ_i + φ·lx_i,t-1 + θp_i·lrp_i,t-1 + θy_i·ly_i,t-1
+           [+ D_post·(μ2_i + δp_i·lrp_i,t-1 + δy_i·ly_i,t-1)]
+           + Σ a_k Δlx_i,t-k + Σ b_k Δlrp_i,t-k + Σ g_k Δly_i,t-k + ay kuklaları + COVID kuklaları + ε
+  - Bölgeye özel uzun dönem: fiyat −θp_i/φ, gelir −θy_i/φ (delta yöntemi)
+  - Ortak: uyarlanma hızı φ, kısa dönem dinamikleri, mevsimsellik (verimlilik kazancı)
+  - Pandemi sonrası (2021+) uzun dönem: −(θ_i+δ_i)/φ
+  - Standart hatalar ay bazında kümelenmiş (bölgeler arası eşanlı şoklara dayanıklı)
+  - Gecikme uzunluğu (1–4) havuzlanmış modelde AIC ile
+  Ayrıca: "Panel ortalaması" (sektör içinde ortak θ) ve "Tüm imalat" (bölge içinde sektörler
+  havuzlanmış, sektör sabit etkili, ortak θ) satırları; 60 aylık kayan pencere panel ECM.
 
-LP-IV (Jordà; kümülatif, Ramey normalizasyonu):
-  lx_{t+h}-lx_{t-1} = α + β_h (lrp_{t+h}-lrp_{t-1}) + γ_h (ly_{t+h}-ly_{t-1}) + kontroller + ε
-  lrp kümülatif değişimi araçlanır: Δln(USD/TRY)_t, Δln(USD/EUR)_t
+SAĞLAMLIK
+  - Hücre bazında ARDL-ECM (sektör × bölge; AIC gecikme ≤6, Pesaran-Shin-Smith sınır testi)
+  - LP-IV (Jordà; kümülatif): lx_{t+h}-lx_{t-1} = β_h (lrp_{t+h}-lrp_{t-1}) + γ_h (ly_{t+h}-ly_{t-1}) + …
+    göreli fiyat Δln(USD/TRY) ve Δln(USD/EUR) ile araçlanır.
 """
 import os
 import sys
@@ -23,50 +27,34 @@ import statsmodels.api as sm
 from linearmodels.iv import IV2SLS
 
 sys.path.insert(0, os.path.dirname(__file__))
-from config import COVID, OUTPUT, POST_START, PROC  # noqa: E402
+from config import COVID, OUTPUT, POST_START, PROC, REGIONS, SECTORS, START  # noqa: E402
 
 warnings.filterwarnings("ignore")
-MAXLAG = 6
+MAXLAG = 6           # hücre ARDL
+PANEL_MAXLAG = 4     # panel ECM
+MIN_OBS = 120        # bir hücrenin modele girmesi için en az geçerli ay
 HAC = {"cov_type": "HAC", "cov_kwds": {"maxlags": 6}}
 # PSS (2001) kritik değerler, case III (kısıtsız sabit, trend yok), k=2, %5
 PSS_F = (3.79, 4.85)
 PSS_T = (-2.86, -3.53)
+TOTAL = "Tüm imalat"
+POOLED = "Panel ortalaması"
 
 
+# ------------------------------------------------------------------ ortak yardımcılar
 def dummies(dates):
     d = pd.PeriodIndex(dates, freq="M")
-    X = pd.get_dummies(d.month, prefix="m", drop_first=True).astype(float)
-    X.index = dates.index
+    X = pd.DataFrame(index=dates.index)
+    for m in range(2, 13):
+        X[f"m_{m}"] = (d.month == m).astype(float)
     for m in pd.period_range("2020-03", "2020-06", freq="M"):
         X[f"cv_{m}"] = (d == m).astype(float)
     X["cv_step"] = ((d >= pd.Period("2020-07", "M")) & (d <= pd.Period(COVID[1], "M"))).astype(float)
     return X
 
 
-def ecm_design(df, L, post=False):
-    y, p, yy = df.lx, df.lrp, df.ly
-    X = pd.DataFrame(index=df.index)
-    X["y_l1"], X["p_l1"], X["inc_l1"] = y.shift(1), p.shift(1), yy.shift(1)
-    if post:
-        D = (pd.PeriodIndex(df.date, freq="M") >= pd.Period(POST_START, "M")).astype(float)
-        X["D"], X["Dp_l1"], X["Dinc_l1"] = D, D * p.shift(1), D * yy.shift(1)
-    for i in range(1, L + 1):
-        X[f"dy_l{i}"] = y.diff().shift(i)
-    for i in range(0, L + 1):
-        X[f"dp_l{i}"] = p.diff().shift(i)
-        X[f"dinc_l{i}"] = yy.diff().shift(i)
-    X = pd.concat([X, dummies(df.date)], axis=1)
-    X = sm.add_constant(X)
-    return y.diff(), X
-
-
-def fit_ecm(df, L, post=False, start=MAXLAG + 1):
-    dy, X = ecm_design(df, L, post)
-    ok = dy.notna() & X.notna().all(axis=1)
-    ok.iloc[:start] = False  # tüm gecikme uzunlukları için aynı örneklem (AIC karşılaştırması)
-    X = X.loc[ok]
-    X = X.loc[:, X.std() > 0].assign(const=1.0)
-    return sm.OLS(dy[ok], X).fit(**HAC)
+def post_dummy(dates):
+    return (pd.PeriodIndex(dates, freq="M") >= pd.Period(POST_START, "M")).astype(float)
 
 
 def longrun(res, num, den="y_l1"):
@@ -88,29 +76,144 @@ def stars(t):
     return "***" if a > 2.576 else "**" if a > 1.96 else "*" if a > 1.645 else ""
 
 
+def valid_cell(df):
+    return df[["lx", "lrp", "ly"]].notna().all(axis=1).sum() >= MIN_OBS
+
+
+# ------------------------------------------------------------------ panel ECM
+def short_run(df, L):
+    X = pd.DataFrame(index=df.index)
+    for i in range(1, L + 1):
+        X[f"dy_l{i}"] = df.lx.diff().shift(i)
+    for i in range(0, L + 1):
+        X[f"dp_l{i}"] = df.lrp.diff().shift(i)
+        X[f"dinc_l{i}"] = df.ly.diff().shift(i)
+    return X
+
+
+def panel_design(cells, L, hetero, post):
+    """cells: [(anahtar, df)]. hetero=True -> uzun dönem θ'lar anahtara özel."""
+    ys, Xs, ts = [], [], []
+    for k, df in cells:
+        df = df.reset_index(drop=True)
+        X = pd.DataFrame(index=df.index)
+        X["y_l1"] = df.lx.shift(1)
+        sfx = f"__{k}" if hetero else ""
+        X["p_l1" + sfx], X["inc_l1" + sfx] = df.lrp.shift(1), df.ly.shift(1)
+        X[f"fe__{k}"] = 1.0
+        if post:
+            D = post_dummy(df.date)
+            X[f"D__{k}"] = D
+            X["Dp_l1" + sfx] = D * df.lrp.shift(1)
+            X["Dinc_l1" + sfx] = D * df.ly.shift(1)
+        X = pd.concat([X, short_run(df, L), dummies(df.date)], axis=1)
+        dy = df.lx.diff()
+        ok = dy.notna() & X.notna().all(axis=1)
+        ok.iloc[:PANEL_MAXLAG + 1] = False  # tüm L için aynı örneklem
+        ys.append(dy[ok]); Xs.append(X[ok]); ts.append(df.date[ok])
+    y = pd.concat(ys, ignore_index=True)
+    X = pd.concat(Xs, ignore_index=True).fillna(0.0)
+    X = X.loc[:, (X != 0).any()]
+    t = pd.concat(ts, ignore_index=True)
+    return y, X, t
+
+
+def fit_panel(cells, L, hetero=True, post=False):
+    y, X, t = panel_design(cells, L, hetero, post)
+    g = pd.factorize(t)[0]
+    return sm.OLS(y, X).fit(cov_type="cluster", cov_kwds={"groups": g})
+
+
+def panel_lag(cells):
+    aic = {L: sm.OLS(*panel_design(cells, L, True, False)[:2]).fit().aic
+           for L in range(1, PANEL_MAXLAG + 1)}
+    return min(aic, key=aic.get)
+
+
+def panel_results(cells, L, hetero):
+    """Uzun dönem (tüm / öncesi / sonrası) ve kısa dönem esneklikler. hetero ise anahtar başına satır."""
+    base = fit_panel(cells, L, hetero, post=False)
+    inter = fit_panel(cells, L, hetero, post=True)
+    keys = [k for k, _ in cells] if hetero else [None]
+    out = []
+    for k in keys:
+        sfx = f"__{k}" if hetero else ""
+        o = {"key": k, "lag": L, "n": int(base.nobs), "r2": base.rsquared_adj,
+             "phi": base.params["y_l1"], "phi_t": base.tvalues["y_l1"],
+             "phi_post": inter.params["y_l1"]}
+        for tag, var in [("p", "p_l1"), ("y", "inc_l1")]:
+            v = var + sfx
+            o[f"{tag}_full"], o[f"{tag}_full_se"] = longrun(base, [v])
+            o[f"{tag}_pre"], o[f"{tag}_pre_se"] = longrun(inter, [v])
+            o[f"{tag}_post"], o[f"{tag}_post_se"] = longrun(inter, [v, "D" + v])
+            lr, se = longrun(inter, ["D" + v])
+            o[f"{tag}_diff_t"] = lr / se
+        o["p_sr"], o["p_sr_se"] = base.params["dp_l0"], base.bse["dp_l0"]
+        o["y_sr"], o["y_sr_se"] = base.params["dinc_l0"], base.bse["dinc_l0"]
+        o["coint"] = "panel"
+        out.append(o)
+    return out
+
+
+def panel_rolling(cells, L, window=60):
+    """Bölgeye özel uzun dönem esneklikler, 60 aylık kayan pencere (ay sonu tarihine göre)."""
+    dates = pd.period_range(START, cells[0][1].date.iloc[-1], freq="M")
+    rows = []
+    for end in range(window + PANEL_MAXLAG, len(dates) + 1, 3):  # 3 ayda bir
+        lo, hi = str(dates[end - window - PANEL_MAXLAG]), str(dates[end - 1])
+        sub = [(k, d[(d.date >= lo) & (d.date <= hi)]) for k, d in cells]
+        sub = [(k, d) for k, d in sub if d[["lx", "lrp", "ly"]].notna().all(axis=1).sum() >= window * 0.8]
+        if not sub:
+            continue
+        try:
+            res = fit_panel(sub, L, hetero=True)
+        except Exception:
+            continue
+        for k, _ in sub:
+            lp, sp = longrun(res, [f"p_l1__{k}"])
+            ly, sy = longrun(res, [f"inc_l1__{k}"])
+            rows.append({"date": hi, "region": k, "p_lr": lp, "p_se": sp, "y_lr": ly, "y_se": sy,
+                         "phi": res.params["y_l1"]})
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------------ hücre ARDL (sağlamlık)
+def ecm_design(df, L, post=False):
+    X = pd.DataFrame(index=df.index)
+    X["y_l1"], X["p_l1"], X["inc_l1"] = df.lx.shift(1), df.lrp.shift(1), df.ly.shift(1)
+    if post:
+        D = post_dummy(df.date)
+        X["D"], X["Dp_l1"], X["Dinc_l1"] = D, D * df.lrp.shift(1), D * df.ly.shift(1)
+    X = pd.concat([X, short_run(df, L), dummies(df.date)], axis=1)
+    return df.lx.diff(), sm.add_constant(X)
+
+
+def fit_ecm(df, L, post=False, start=MAXLAG + 1):
+    dy, X = ecm_design(df, L, post)
+    ok = dy.notna() & X.notna().all(axis=1)
+    ok.iloc[:start] = False
+    X = X.loc[ok]
+    X = X.loc[:, X.std() > 0].assign(const=1.0)
+    return sm.OLS(dy[ok], X).fit(**HAC)
+
+
 def estimate_cell(df):
     df = df.reset_index(drop=True)
-    # gecikme seçimi (AIC), temel model
     aics = {L: fit_ecm(df, L).aic for L in range(1, MAXLAG + 1)}
     L = min(aics, key=aics.get)
     base = fit_ecm(df, L)
     inter = fit_ecm(df, L, post=True)
     out = {"lag": L, "n": int(base.nobs), "r2": base.rsquared_adj}
     for tag, var in [("p", "p_l1"), ("y", "inc_l1")]:
-        lr, se = longrun(base, [var])
-        out[f"{tag}_full"], out[f"{tag}_full_se"] = lr, se
-        lr, se = longrun(inter, [var])
-        out[f"{tag}_pre"], out[f"{tag}_pre_se"] = lr, se
-        lr, se = longrun(inter, [var, "D" + var])
-        out[f"{tag}_post"], out[f"{tag}_post_se"] = lr, se
-        # fark testi (post - pre = -δ/φ)
+        out[f"{tag}_full"], out[f"{tag}_full_se"] = longrun(base, [var])
+        out[f"{tag}_pre"], out[f"{tag}_pre_se"] = longrun(inter, [var])
+        out[f"{tag}_post"], out[f"{tag}_post_se"] = longrun(inter, [var, "D" + var])
         lr, se = longrun(inter, ["D" + var])
         out[f"{tag}_diff_t"] = lr / se
     out["p_sr"], out["p_sr_se"] = base.params["dp_l0"], base.bse["dp_l0"]
     out["y_sr"], out["y_sr_se"] = base.params["dinc_l0"], base.bse["dinc_l0"]
     out["phi"], out["phi_t"] = base.params["y_l1"], base.tvalues["y_l1"]
     out["phi_post"] = inter.params["y_l1"]
-    # PSS sınır testi (F): φ=θp=θy=0  (standart OLS kovaryansı ile)
     ols = sm.OLS(base.model.endog, base.model.exog).fit()
     names = base.model.exog_names
     R = np.zeros((3, len(names)))
@@ -121,56 +224,6 @@ def estimate_cell(df):
     out["coint"] = ("evet" if out["bounds_F"] > PSS_F[1] and out["bounds_t"] < PSS_T[1]
                     else "belirsiz" if out["bounds_F"] > PSS_F[0] else "hayır")
     return out
-
-
-def estimate_panel(cells, L=2):
-    """Havuzlanmış ECM: ortak uzun dönem katsayıları, bölge sabit etkileri, zamana göre kümelenmiş SE."""
-    out = {"lag": L}
-    for post in (False, True):
-        ys, Xs, groups = [], [], []
-        for k, (r, df) in enumerate(cells):
-            df = df.reset_index(drop=True)
-            dy, X = ecm_design(df, L, post)
-            X[f"fe_{k}"] = 1.0
-            ok = dy.notna() & X.notna().all(axis=1)
-            ok.iloc[:MAXLAG + 1] = False
-            ys.append(dy[ok]); Xs.append(X[ok]); groups.append(df.date[ok])
-        y = pd.concat(ys, ignore_index=True)
-        X = pd.concat(Xs, ignore_index=True).fillna(0.0).drop(columns="const")
-        X = X.loc[:, X.std() > 0]
-        g = pd.factorize(pd.concat(groups, ignore_index=True))[0]
-        res = sm.OLS(y, X).fit(cov_type="cluster", cov_kwds={"groups": g})
-        for tag, var in [("p", "p_l1"), ("y", "inc_l1")]:
-            if not post:
-                out[f"{tag}_full"], out[f"{tag}_full_se"] = longrun(res, [var])
-            else:
-                out[f"{tag}_pre"], out[f"{tag}_pre_se"] = longrun(res, [var])
-                out[f"{tag}_post"], out[f"{tag}_post_se"] = longrun(res, [var, "D" + var])
-                lr, se = longrun(res, ["D" + var])
-                out[f"{tag}_diff_t"] = lr / se
-        if not post:
-            out["n"], out["r2"] = int(res.nobs), res.rsquared_adj
-            out["phi"], out["phi_t"] = res.params["y_l1"], res.tvalues["y_l1"]
-            out["p_sr"], out["p_sr_se"] = res.params["dp_l0"], res.bse["dp_l0"]
-            out["y_sr"], out["y_sr_se"] = res.params["dinc_l0"], res.bse["dinc_l0"]
-    out["coint"] = "panel"
-    return out
-
-
-def rolling(df, L, window=60):
-    df = df.reset_index(drop=True)
-    rows = []
-    for end in range(window + MAXLAG, len(df) + 1, 1):
-        sub = df.iloc[end - window - MAXLAG:end].reset_index(drop=True)
-        try:
-            r = fit_ecm(sub, L)
-            lp, sp = longrun(r, ["p_l1"])
-            ly, sy = longrun(r, ["inc_l1"])
-            rows.append({"date": sub.date.iloc[-1], "p_lr": lp, "p_se": sp, "y_lr": ly, "y_se": sy,
-                         "phi": r.params["y_l1"]})
-        except Exception:
-            pass
-    return pd.DataFrame(rows)
 
 
 def lp_iv(df, H=12, nlags=3):
@@ -185,8 +238,7 @@ def lp_iv(df, H=12, nlags=3):
     for h in range(H + 1):
         dep = df.lx.shift(-h) - df.lx.shift(1)
         endog = (df.lrp.shift(-h) - df.lrp.shift(1)).rename("cum_rp")
-        exo = pd.concat([(df.ly.shift(-h) - df.ly.shift(1)).rename("cum_y"), ctrl], axis=1)
-        exo = sm.add_constant(exo)
+        exo = sm.add_constant(pd.concat([(df.ly.shift(-h) - df.ly.shift(1)).rename("cum_y"), ctrl], axis=1))
         ok = dep.notna() & endog.notna() & exo.notna().all(axis=1) & inst.notna().all(axis=1)
         exo_ok = exo[ok].loc[:, exo[ok].std() > 0].assign(const=1.0)
         m = IV2SLS(dep[ok], exo_ok, endog[ok], inst[ok]).fit(
@@ -198,34 +250,59 @@ def lp_iv(df, H=12, nlags=3):
     return pd.DataFrame(out)
 
 
+# ------------------------------------------------------------------ main
 def main():
     OUTPUT.mkdir(parents=True, exist_ok=True)
     panel = pd.read_csv(PROC / "panel.csv")
-    res, roll, lps = [], [], []
-    for (s, r), df in panel.groupby(["sector", "region"], sort=False):
-        df = df.dropna(subset=["lx", "lrp", "ly"])
-        print(f"{s} {r} ...", flush=True)
-        o = estimate_cell(df)
-        o.update(sector=s, region=r)
-        res.append(o)
-        rr = rolling(df, o["lag"])
-        rr["sector"], rr["region"] = s, r
+    cells = {k: g.reset_index(drop=True) for k, g in panel.groupby(["sector", "region"], sort=False)}
+    cells = {k: g for k, g in cells.items() if valid_cell(g)}
+    dropped = sorted(set(panel.groupby(["sector", "region"]).groups) - set(cells))
+    print(f"{len(cells)} hücre modelde; veri yetersiz: {dropped}")
+
+    main_rows, roll = [], []
+    # 1) Ana model: sektör başına bölgeye özel uzun dönem panel ECM + panel ortalaması
+    for s in SECTORS:
+        cs = [(r, cells[(s, r)]) for r in REGIONS if (s, r) in cells]
+        if len(cs) < 2:
+            continue
+        L = panel_lag(cs)
+        print(f"panel {s}: {len(cs)} bölge, L={L}", flush=True)
+        for o in panel_results(cs, L, hetero=True):
+            main_rows.append({**o, "sector": s, "region": o.pop("key")})
+        for o in panel_results(cs, L, hetero=False):
+            o.pop("key")
+            main_rows.append({**o, "sector": s, "region": POOLED})
+        rr = panel_rolling(cs, L)
+        rr["sector"] = s
         roll.append(rr)
-        lp = lp_iv(df)
-        lp["sector"], lp["region"] = s, r
-        lps.append(lp)
-    for s, g in panel.groupby("sector", sort=False):
-        cells = [(r, d.dropna(subset=["lx", "lrp", "ly"])) for r, d in g.groupby("region", sort=False)]
-        o = estimate_panel(cells)
-        o.update(sector=s, region="Panel (tüm bölgeler)")
-        res.append(o)
-    res = pd.DataFrame(res)
-    res.to_csv(OUTPUT / "ecm_results.csv", index=False)
-    pd.concat(roll).to_csv(OUTPUT / "rolling.csv", index=False)
+    # 2) Bölge başına tüm imalat (sektörler havuzlanmış, sektör sabit etkili, ortak θ)
+    for r in REGIONS:
+        cs = [(s, cells[(s, r)]) for s in SECTORS if (s, r) in cells]
+        L = panel_lag(cs)
+        print(f"tüm imalat {r}: {len(cs)} sektör, L={L}", flush=True)
+        o = panel_results(cs, L, hetero=False)[0]
+        o.pop("key")
+        main_rows.append({**o, "sector": TOTAL, "region": r})
+    pd.DataFrame(main_rows).to_csv(OUTPUT / "panel_ecm_results.csv", index=False)
+    pd.concat(roll).to_csv(OUTPUT / "panel_rolling.csv", index=False)
+
+    # 3) Sağlamlık: hücre ARDL ve LP-IV
+    ardl, lps = [], []
+    for (s, r), df in cells.items():
+        df = df.dropna(subset=["lx", "lrp", "ly"]).reset_index(drop=True)
+        try:
+            o = estimate_cell(df)
+            ardl.append({**o, "sector": s, "region": r})
+            lp = lp_iv(df)
+            lp["sector"], lp["region"] = s, r
+            lps.append(lp)
+        except Exception as e:
+            print(f"ARDL/LP {s} {r}: {e}")
+    pd.DataFrame(ardl).to_csv(OUTPUT / "ardl_cell_results.csv", index=False)
     pd.concat(lps).to_csv(OUTPUT / "lp_iv.csv", index=False)
-    cols = ["sector", "region", "lag", "n", "p_full", "p_pre", "p_post", "y_full", "y_pre", "y_post",
-            "phi", "bounds_F", "coint"]
-    print(res[cols].round(2).to_string())
+    m = pd.DataFrame(main_rows)
+    print(m[["sector", "region", "lag", "p_full", "p_full_se", "y_full", "y_full_se", "phi"]]
+          .round(2).to_string())
 
 
 if __name__ == "__main__":

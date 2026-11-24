@@ -1,4 +1,4 @@
-"""Proje genel tanımları: bölgeler, pilot sektörler, HS ve SITC eşlemeleri."""
+"""Proje genel tanımları: dönem, bölgeler, sektörler, birim değer parametreleri."""
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -6,7 +6,7 @@ RAW = ROOT / "data" / "raw"
 PROC = ROOT / "data" / "processed"
 OUTPUT = ROOT / "output"
 
-START, END = "2013-01", "2026-08"
+START, END = "2013-01", "2026-08"   # END: Comtrade'de son yayımlanan ay
 POST_START = "2021-01"          # pandemi sonrası dönem başlangıcı
 PRE_END = "2019-12"             # pandemi öncesi dönem sonu
 COVID = ("2020-03", "2020-12")  # kukla ile kontrol edilen dönem
@@ -38,16 +38,21 @@ REGIONS = {
 # Fiyat endeksinde resmi kur ile piyasa kuru çok ayrışan / verisi güvenilmez ülkeler
 PRICE_EXCLUDE = ["IRN", "SYR", "LBN", "YEM", "LBY", "SDN", "SSD", "PSE", "XKX", "ERI", "SOM"]
 
-# --- Pilot sektörler: NACE Rev.2 -> HS fasılları (Comtrade) -> SITC (TÜİK birim değer) --
-# HS fasıl düzeyi yaklaşık eşlemedir; tam sürümde HS6 -> CPA/NACE uyum tablosu kullanılacak.
-# Fiyat: fasılın karşılık geldiği SITC Rev.4 ihracat birim değer endeksi (TÜİK, USD, 2015=100);
-# sektör fiyatı bu endekslerin Comtrade ihracat değeriyle ağırlıklı zincirleme Törnqvist'i.
+# --- İmalat sektörleri: NACE Rev.2 bölümleri (C10–C33) ------------------------------
+# HS6 → NACE eşlemesi src/concordance.py ile (data/ref/hs6_nace2.csv) kurulur.
+# C33 (onarım ve kurulum) hizmet faaliyetidir; HS kapsamında mal ihracatı yoktur.
 SECTORS = {
-    "C10": {"ad": "Gıda ürünleri",
-            "hs": {"02": "01", "16": "01", "04": "02", "11": "04", "19": "04", "17": "06",
-                   "18": "07", "23": "08", "20": "05", "21": "09", "15": "42"}},
-    "C24": {"ad": "Ana metal",
-            "hs": {"72": "67", "74": "68", "76": "68"}},
-    "C29": {"ad": "Motorlu kara taşıtları",
-            "hs": {"87": "78"}},
+    "C10": "Gıda ürünleri", "C11": "İçecekler", "C12": "Tütün ürünleri", "C13": "Tekstil ürünleri",
+    "C14": "Giyim eşyası", "C15": "Deri ve ilgili ürünler", "C16": "Ağaç ve mantar ürünleri",
+    "C17": "Kâğıt ve kâğıt ürünleri", "C18": "Basım ve kayıt hizmetleri", "C19": "Kok ve rafine petrol",
+    "C20": "Kimyasallar", "C21": "Temel eczacılık ürünleri", "C22": "Kauçuk ve plastik",
+    "C23": "Diğer metalik olmayan mineral", "C24": "Ana metal", "C25": "Fabrikasyon metal",
+    "C26": "Bilgisayar, elektronik ve optik", "C27": "Elektrikli teçhizat", "C28": "Makine ve ekipman",
+    "C29": "Motorlu kara taşıtları", "C30": "Diğer ulaşım araçları", "C31": "Mobilya",
+    "C32": "Diğer imalat", "C33": "Makine ve ekipman onarım ve kurulumu",
 }
+
+# --- Birim değer endeksi parametreleri --------------------------------------------
+UV_MIN_VALUE = 5_000      # USD; bundan küçük HS6×ülke×ay işlemleri birim değerde kullanılmaz
+UV_TRIM = 3.0             # TPD artığı |e| > UV_TRIM × sağlam std ise gözlem atılır
+UV_MIN_ITEMS = 5          # ayda en az bu kadar eşleşen kalem yoksa endeks interpolasyonla doldurulur

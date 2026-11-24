@@ -1,11 +1,10 @@
-"""Makro veriler: partner geliri, partner fiyatları, kurlar, TÜİK SITC birim değer endeksleri.
+"""Makro veriler: partner geliri, partner fiyatları, kurlar.
 
 Kaynaklar
 - IMF WEO: yıllık reel GSYH (NGDP_R), tüm ülkeler (2026 IMF tahmini dahil)
 - IMF CPI: aylık TÜFE (toplam), IMF ER: aylık ortalama kur (ulusal para / USD)
 - FRED: ABD sanayi üretimi (INDPRO), EUR/USD (DEXUSEU), ABD reel GSYH (GDPC1)
 - Eurostat: AB-27 sanayi üretimi (sts_inpr_m), AB-27 çeyreklik reel GSYH (namq_10_gdp)
-- TÜİK SDMX: SITC bazında ihracat birim değer endeksleri (TUIK_API_KEY ortam değişkeni)
 """
 import io
 import os
@@ -62,22 +61,6 @@ def eurostat(ds, params):
     return pd.DataFrame({"date": [inv[int(i)] for i in j["value"]], "value": list(j["value"].values())})
 
 
-def tuik_token():
-    r = requests.post("https://giris.tuik.gov.tr/realms/web/protocol/openid-connect/token",
-                      data={"grant_type": "password", "client_id": "nsi-ws-consumer",
-                            "api_key": os.environ["TUIK_API_KEY"]},
-                      headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
-    r.raise_for_status()
-    return r.json()["access_token"]
-
-
-def tuik(flow, token):
-    r = get(f"https://nsiws.tuik.gov.tr/rest/data/TR,{flow},1.0/all",
-            {"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0",
-             "Accept": "application/vnd.sdmx.data+csv;version=1.0.0"})
-    return pd.read_csv(io.StringIO(r.text), low_memory=False)
-
-
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     cols = {"COUNTRY", "INDICATOR", "TIME_PERIOD", "OBS_VALUE", "TYPE_OF_TRANSFORMATION",
@@ -102,10 +85,6 @@ def main():
     eurostat("namq_10_gdp", {"geo": "EU27_2020", "na_item": "B1GQ", "s_adj": "SCA", "unit": "CLV10_MEUR"}) \
         .to_csv(OUT / "eu_gdp_q.csv", index=False)
 
-    print("TÜİK SITC birim değer ve miktar endeksleri")
-    tok = tuik_token()
-    for flow in ["DF_IHRACAT_BIRIM_DEGER_V1", "DF_IHRACAT_MIKTAR_ENDEKS_V1"]:
-        tuik(flow, tok).to_csv(OUT / f"tuik_{flow}.csv", index=False)
     print("tamam")
 
 
